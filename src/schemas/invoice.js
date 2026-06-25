@@ -201,6 +201,11 @@ const invoiceUpdateSchema = z
       .max(100, { message: 'invoiceNumber must not exceed 100 characters' })
       .optional(),
 
+    notes: z
+      .string()
+      .max(2000, { message: 'notes must not exceed 2000 characters' })
+      .optional(),
+
     status: z
       .enum(['pending', 'paid', 'overdue', 'cancelled'], {
         errorMap: () => ({ message: 'status must be one of: pending, paid, overdue, cancelled' }),

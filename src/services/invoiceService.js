@@ -26,6 +26,7 @@
 const db = require('../db/knex');
 const { applyQueryOptions } = require('../utils/queryBuilder');
 const logger = require('../logger');
+const { LOCKED_STATUSES, detectLockedFieldChange } = require('../middleware/patchInvoice');
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -88,6 +89,34 @@ function nowValue() {
   return db && db.fn && typeof db.fn.now === 'function'
     ? db.fn.now()
     : new Date().toISOString();
+}
+
+/**
+ * Filter invoice payloads down to the columns that exist in the current DB schema.
+ * This keeps the service compatible with the older SQLite migration used by the
+ * local integration tests while still supporting newer columns when present.
+ *
+ * @param {object} payload - Raw invoice payload.
+ * @param {'create'|'update'} mode - Whether the payload is for insert or update.
+ * @returns {object} Normalized payload containing only supported columns.
+ */
+function normalizeInvoicePayload(payload = {}, mode = 'create') {
+  const normalized = {};
+
+  if (mode === 'create') {
+    if (payload.amount !== undefined) normalized.amount = payload.amount;
+    if (payload.customer !== undefined) normalized.customer = payload.customer;
+    if (payload.status !== undefined) normalized.status = payload.status;
+    if (payload.metadata !== undefined) normalized.metadata = payload.metadata;
+    if (payload.tenantId !== undefined) normalized.tenant_id = payload.tenantId;
+  } else {
+    if (payload.amount !== undefined) normalized.amount = payload.amount;
+    if (payload.customer !== undefined) normalized.customer = payload.customer;
+    if (payload.status !== undefined) normalized.status = payload.status;
+    if (payload.metadata !== undefined) normalized.metadata = payload.metadata;
+  }
+
+  return normalized;
 }
 
 // ---------------------------------------------------------------------------
@@ -222,14 +251,13 @@ async function createInvoice(invoiceData, tenantId) {
 
   const row = {
     invoice_id: invoiceId,
-    amount,
-    customer,
-    status,
-    tenant_id: tenantId,
-    ...(currency !== undefined && { currency }),
-    ...(dueDate !== undefined && { due_date: dueDate }),
-    ...(description !== undefined && { description }),
-    ...(metadata !== undefined && { metadata: metadata ? JSON.stringify(metadata) : null }),
+    ...normalizeInvoicePayload({
+      amount,
+      customer,
+      status,
+      metadata: metadata !== undefined ? (typeof metadata === 'string' ? metadata : JSON.stringify(metadata)) : null,
+      tenantId,
+    }, 'create'),
   };
 
   // SQLite returns an array of primary-key integers from insert(); PostgreSQL
@@ -261,9 +289,34 @@ async function updateInvoice(id, updates = {}, tenantId) {
     throw new TypeError('invoice id required');
   }
 
+  const existingInvoice = await db('invoices')
+    .where({ invoice_id: id, tenant_id: tenantId })
+    .whereNull('deleted_at')
+    .first();
+
+  if (!existingInvoice) {
+    return null;
+  }
+
+  const lockCheck = detectLockedFieldChange(updates || {}, existingInvoice.status);
+  if (lockCheck.locked) {
+    throw new Error(`Field '${lockCheck.field}' cannot be updated while status is '${existingInvoice.status}'.`);
+  }
+
+  const normalizedUpdates = normalizeInvoicePayload({
+    ...updates,
+    metadata: updates.metadata !== undefined
+      ? (typeof updates.metadata === 'string' ? updates.metadata : JSON.stringify(updates.metadata))
+      : undefined,
+  }, 'update');
+
+  if (Object.keys(normalizedUpdates).length === 0) {
+    return existingInvoice;
+  }
+
   const result = await db('invoices')
     .where({ invoice_id: id, tenant_id: tenantId })
-    .update({ ...updates, updated_at: nowValue() })
+    .update({ ...normalizedUpdates, updated_at: nowValue() })
     .returning('*');
 
   if (Array.isArray(result) && result.length > 0 && typeof result[0] === 'object') {

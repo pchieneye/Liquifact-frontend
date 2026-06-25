@@ -22,7 +22,8 @@ const smeRouter = require('../sme');
 const { extractTenant } = require('../../middleware/tenant');
 const invoiceService = require('../../services/invoiceService');
 const AppError = require('../../errors/AppError');
-const { invoiceCreateSchema, parseValidationErrors } = require('../../schemas/invoice');
+const { invoiceCreateSchema, invoiceUpdateSchema, parseValidationErrors } = require('../../schemas/invoice');
+const { validatePatchFields, detectLockedFieldChange } = require('../../middleware/patchInvoice');
 
 // ── Sub-router mounts ────────────────────────────────────────────────────────
 router.use('/invest', investRoutes);
@@ -147,6 +148,114 @@ router.post('/invoices', extractTenant, async (req, res, next) => {
     return res.status(201).json({
       data: invoice,
       message: 'Invoice created successfully.',
+    });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+/**
+ * PATCH /v1/invoices/:id
+ *
+ * Applies validated partial updates to an invoice scoped to the authenticated tenant.
+ * Uses the field guard middleware to strip unsupported keys and reject edits to
+ * locked fields once an invoice reaches a protected status.
+ */
+router.patch('/invoices/:id', extractTenant, validatePatchFields, async (req, res, next) => {
+  try {
+    const parsed = invoiceUpdateSchema.safeParse(req.sanitizedUpdate);
+
+    if (!parsed.success) {
+      const fieldErrors = parseValidationErrors(parsed.error);
+      return next(
+        new AppError({
+          type: 'https://liquifact.com/probs/validation-error',
+          title: 'Validation Error',
+          status: 422,
+          detail: 'Request body contains invalid or missing fields.',
+          instance: req.originalUrl,
+          code: 'VALIDATION_ERROR',
+          retryable: false,
+          retryHint: 'Correct the highlighted fields and retry.',
+          fieldErrors,
+        }),
+      );
+    }
+
+    const existingInvoice = await invoiceService.getInvoiceById(req.params.id, req.tenantId);
+    if (!existingInvoice) {
+      return next(
+        new AppError({
+          type: 'https://liquifact.com/probs/not-found',
+          title: 'Not Found',
+          status: 404,
+          detail: 'Invoice not found.',
+          instance: req.originalUrl,
+          code: 'NOT_FOUND',
+        }),
+      );
+    }
+
+    const lockCheck = detectLockedFieldChange(req.sanitizedUpdate, existingInvoice.status);
+    if (lockCheck.locked) {
+      return next(
+        new AppError({
+          type: 'https://liquifact.com/probs/validation-error',
+          title: 'Validation Error',
+          status: 422,
+          detail: `Field '${lockCheck.field}' is locked for invoice status '${existingInvoice.status}'.`,
+          instance: req.originalUrl,
+          code: 'VALIDATION_ERROR',
+          retryable: false,
+          retryHint: 'Use a pending invoice or wait for the invoice to move back to a mutable state.',
+          fieldErrors: { [lockCheck.field]: `Field '${lockCheck.field}' cannot be updated while status is '${existingInvoice.status}'.` },
+        }),
+      );
+    }
+
+    const updatePayload = {
+      ...parsed.data,
+      ...(parsed.data.customer !== undefined ? { customer: parsed.data.customer } : {}),
+      ...(parsed.data.buyer !== undefined ? { customer: parsed.data.buyer } : {}),
+    };
+
+    const invoice = await invoiceService.updateInvoice(req.params.id, updatePayload, req.tenantId);
+
+    return res.json({
+      data: invoice,
+      message: 'Invoice updated successfully.',
+    });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+/**
+ * DELETE /v1/invoices/:id
+ *
+ * Soft-deletes an invoice scoped to the authenticated tenant.
+ */
+router.delete('/invoices/:id', extractTenant, async (req, res, next) => {
+  try {
+    const existingInvoice = await invoiceService.getInvoiceById(req.params.id, req.tenantId);
+    if (!existingInvoice) {
+      return next(
+        new AppError({
+          type: 'https://liquifact.com/probs/not-found',
+          title: 'Not Found',
+          status: 404,
+          detail: 'Invoice not found.',
+          instance: req.originalUrl,
+          code: 'NOT_FOUND',
+        }),
+      );
+    }
+
+    const invoice = await invoiceService.deleteInvoice(req.params.id, req.tenantId);
+
+    return res.json({
+      data: invoice,
+      message: 'Invoice deleted successfully.',
     });
   } catch (err) {
     return next(err);
